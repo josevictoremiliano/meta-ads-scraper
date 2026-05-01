@@ -1,5 +1,9 @@
 const { chromium } = require('playwright');
 
+/**
+ * Scraper v2 - Extração baseada em estrutura de texto real da página
+ * Não depende de classes CSS dinâmicas do Facebook
+ */
 async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxResults = 30 }) {
   const browser = await chromium.launch({
     headless: true,
@@ -8,164 +12,183 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--window-size=1280,900',
     ],
   });
 
   const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'pt-BR',
     viewport: { width: 1280, height: 900 },
+    extraHTTPHeaders: {
+      'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+    },
   });
 
   const page = await context.newPage();
 
-  // Bloquear recursos desnecessarios para ser mais rapido
-  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,mp4,webm}', r => r.abort());
+  // Bloquear recursos pesados desnecessarios
+  await page.route('**/*.{woff,woff2,ttf,mp4,webm}', r => r.abort());
   await page.route('**/video/**', r => r.abort());
 
   const url = buildUrl({ keyword, country, adCategory });
   console.log(`  Navegando: ${url}`);
 
   try {
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   } catch (e) {
-    // timeout parcial ainda pode ter conteudo util
-    console.warn('  Aviso de timeout no goto, tentando extrair mesmo assim...');
+    console.warn('  Timeout no goto, tentando extrair mesmo assim...');
   }
 
-  // Aguarda cards aparecerem
-  await page.waitForSelector('[data-testid="ad-card"], [class*="xh8yej3"], ._7jvw', {
-    timeout: 20000,
-  }).catch(() => console.warn('  Nenhum seletor de card encontrado dentro do timeout'));
+  // Aguarda a página carregar conteúdo real
+  await page.waitForTimeout(4000);
 
-  // Scroll para carregar mais resultados
+  // Scroll progressivo para carregar mais resultados
   const targetCount = Math.min(maxResults, 50);
-  let lastCount = 0;
-  for (let i = 0; i < 8; i++) {
-    const currentCount = await page.locator('[class*="x1dr75xp"][class*="x1lcm9me"], [data-testid="ad-card"]').count();
-    if (currentCount >= targetCount) break;
-    if (currentCount === lastCount && i > 2) break;
-    lastCount = currentCount;
+  for (let i = 0; i < 10; i++) {
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    const adCount = (bodyText.match(/Identificação da biblioteca/g) || []).length;
+    console.log(`  Scroll ${i + 1}: ${adCount} anúncios encontrados`);
+    if (adCount >= targetCount) break;
     await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
   }
 
-  // Extrai dados dos cards
-  const ads = await page.evaluate((maxRes) => {
+  // Extração baseada em texto real da página
+  const ads = await page.evaluate((params) => {
+    const { maxRes, kw } = params;
     const results = [];
+    const bodyText = document.body.innerText;
 
-    // Tenta varios seletores de card possiveis
-    const cardSelectors = [
-      '[data-testid="ad-card"]',
-      '._7jvw',
-      '[class*="x193iq5w"][class*="x1lkfr7t"]',
-    ];
+    // Divide o texto por blocos de anúncio usando o separador real da página
+    // Cada anúncio tem "Identificação da biblioteca: XXXXXXXX"
+    const blocks = bodyText.split(/(?=Identificação da biblioteca\s*:\s*\d+)/);
 
-    let cards = [];
-    for (const sel of cardSelectors) {
-      cards = Array.from(document.querySelectorAll(sel));
-      if (cards.length > 0) break;
-    }
+    for (const block of blocks.slice(0, maxRes + 1)) {
+      if (!block.includes('Identificação da biblioteca')) continue;
 
-    // Fallback: pega todos os divs que parecem cards de anuncio
-    if (cards.length === 0) {
-      cards = Array.from(document.querySelectorAll('div[role="article"], div[class*="ad_archive"]'));
-    }
-
-    for (const card of cards.slice(0, maxRes)) {
       try {
-        // Nome do anunciante
-        const advertiserEl = card.querySelector('a[href*="facebook.com/"], strong, h4');
-        const advertiser_name = advertiserEl?.innerText?.trim() || null;
+        // ID do anúncio
+        const idMatch = block.match(/Identificação da biblioteca\s*:\s*(\d+)/);
+        const ad_id = idMatch ? idMatch[1] : null;
+        if (!ad_id) continue;
 
-        // URL do anunciante
-        const advertiserLink = card.querySelector('a[href*="facebook.com/"]');
-        const advertiser_profile_url = advertiserLink?.href || null;
+        // Status
+        const status = block.includes('Ativo') ? 'ACTIVE' : 'INACTIVE';
 
-        // Texto do anuncio
-        const textSelectors = ['[data-testid="ad-text"]', 'div[dir="auto"]', '[class*="x1lliihq"]'];
-        let ad_text = null;
-        for (const ts of textSelectors) {
-          const el = card.querySelector(ts);
-          if (el?.innerText?.trim()) { ad_text = el.innerText.trim(); break; }
-        }
-
-        // Status e data
-        const statusEl = card.querySelector('[class*="status"], [data-testid="status"]');
-        const status = statusEl?.innerText?.includes('Ativo') ? 'ACTIVE' : 'INACTIVE';
-
-        // Data de inicio
-        const dateEls = card.querySelectorAll('span, p');
-        let start_date = null;
-        for (const el of dateEls) {
-          const t = el.innerText || '';
-          const m = t.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\w+ de \d{4}|\d{4}-\d{2}-\d{2})/);
-          if (m) { start_date = m[1]; break; }
-        }
+        // Data de início
+        const dateMatch = block.match(/Veiculação iniciada em\s+([^\n]+)/);
+        const start_date = dateMatch ? dateMatch[1].trim() : null;
 
         // Plataformas
-        const platformText = card.innerText.toLowerCase();
         const platforms = [];
-        if (platformText.includes('facebook')) platforms.push('facebook');
-        if (platformText.includes('instagram')) platforms.push('instagram');
-        if (platformText.includes('audience network')) platforms.push('audience_network');
-        if (platformText.includes('messenger')) platforms.push('messenger');
+        if (block.toLowerCase().includes('facebook')) platforms.push('facebook');
+        if (block.toLowerCase().includes('instagram')) platforms.push('instagram');
+        if (block.toLowerCase().includes('audience network')) platforms.push('audience_network');
+        if (block.toLowerCase().includes('messenger')) platforms.push('messenger');
+        if (platforms.length === 0) platforms.push('facebook');
 
-        // Tipo de midia
-        const hasVideo = !!card.querySelector('video, [data-testid="video"]');
-        const hasImage = !!card.querySelector('img[src*="fbcdn"], img[src*="scontent"]');
-        const media_type = hasVideo ? 'video' : hasImage ? 'image' : 'text';
+        // Nome do anunciante - primeira linha não vazia antes do status
+        const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+        const advertiser_name = lines[0] || null;
 
-        // Imagem
-        const imgEl = card.querySelector('img[src*="fbcdn"], img[src*="scontent"]');
-        const image_url = imgEl?.src || null;
+        // Texto do anúncio - linhas que não são metadados
+        const metaPatterns = [
+          /Identificação da biblioteca/,
+          /Veiculação iniciada em/,
+          /^Ativo$/,
+          /^Inativo$/,
+          /^Facebook$/i,
+          /^Instagram$/i,
+          /^Messenger$/i,
+          /Audience Network/i,
+          /^Ver detalhes/i,
+          /^Patrocinado$/i,
+          /^Saiba mais$/i,
+          /^Comprar$/i,
+          /^Inscreva-se$/i,
+          /^Assinar$/i,
+          /^Cadastre-se$/i,
+        ];
 
-        // Link do anuncio
-        const adLink = card.querySelector('a[href*="ads/library"]');
-        const ad_snapshot_url = adLink?.href || null;
+        const textLines = lines.filter(line => {
+          if (line === advertiser_name) return false;
+          for (const p of metaPatterns) {
+            if (p.test(line)) return false;
+          }
+          return line.length > 10;
+        });
 
-        // Landing domain
-        const externalLinks = Array.from(card.querySelectorAll('a[href]'))
-          .filter(a => !a.href.includes('facebook.com') && !a.href.includes('instagram.com'))
-          .map(a => { try { return new URL(a.href).hostname; } catch { return null; } })
-          .filter(Boolean);
-        const landing_domain = externalLinks[0] || null;
+        const ad_text = textLines.slice(0, 5).join(' ') || null;
 
-        // CTA hint
-        const ctaEl = card.querySelector('[data-testid="cta-button"], button, [class*="cta"]');
-        const raw_offer_hint = ctaEl?.innerText?.trim() || null;
+        // CTA hint - detecta botões comuns
+        const ctaPatterns = ['Comprar agora', 'Saiba mais', 'Inscreva-se', 'Assinar', 'Cadastre-se', 'Ver mais', 'Acessar', 'Baixar', 'Entrar em contato', 'Enviar mensagem'];
+        let raw_offer_hint = null;
+        for (const cta of ctaPatterns) {
+          if (block.includes(cta)) {
+            raw_offer_hint = cta;
+            break;
+          }
+        }
 
-        if (advertiser_name || ad_text) {
+        // Tipo de mídia - inferido pelo contexto
+        const media_type = block.toLowerCase().includes('vídeo') || block.toLowerCase().includes('video') ? 'video' : 'image';
+
+        if (advertiser_name && ad_text) {
           results.push({
+            ad_id,
             advertiser_name,
-            advertiser_profile_url,
             ad_text,
             status,
             start_date,
-            platforms: platforms.length ? platforms : ['facebook'],
+            platforms,
             media_type,
-            image_url,
-            ad_snapshot_url,
-            landing_domain,
             raw_offer_hint,
+            ad_snapshot_url: `https://www.facebook.com/ads/library/?id=${ad_id}`,
+            image_url: null,
+            advertiser_profile_url: null,
+            landing_domain: null,
           });
         }
       } catch (e) {
-        // ignora card com erro
+        // ignora bloco com erro
       }
     }
+
     return results;
-  }, maxResults);
+  }, { maxRes: maxResults, kw: keyword });
+
+  // Tenta enriquecer com dados do DOM (URLs, imagens, links)
+  const enriched = await page.evaluate((adsData) => {
+    return adsData.map(ad => {
+      // Tenta achar o link do anunciante pelo ID
+      const allLinks = Array.from(document.querySelectorAll('a[href]'));
+
+      // Landing domain - links externos
+      const externalLinks = allLinks
+        .filter(a => a.href && !a.href.includes('facebook.com') && !a.href.includes('instagram.com') && a.href.startsWith('http'))
+        .map(a => { try { return new URL(a.href).hostname; } catch { return null; } })
+        .filter(Boolean);
+
+      // Imagem - primeira imagem de conteúdo
+      const imgs = Array.from(document.querySelectorAll('img[src*="fbcdn"], img[src*="scontent"]'));
+      const image_url = imgs.length > 0 ? imgs[0].src : null;
+
+      return {
+        ...ad,
+        landing_domain: externalLinks[0] || null,
+        image_url,
+      };
+    });
+  }, ads);
 
   await browser.close();
 
-  // Deduplica por ad_text + advertiser_name
+  // Deduplica por ad_id
   const seen = new Set();
-  return ads.filter(ad => {
-    const key = `${ad.advertiser_name}|${ad.ad_text}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
+  return enriched.filter(ad => {
+    if (seen.has(ad.ad_id)) return false;
+    seen.add(ad.ad_id);
     return true;
   });
 }
@@ -179,6 +202,9 @@ function buildUrl({ keyword, country, adCategory }) {
     q: keyword,
     search_type: 'keyword_unordered',
   });
+  if (adCategory && adCategory !== 'ALL') {
+    params.set('ad_type', adCategory.toLowerCase());
+  }
   return `https://www.facebook.com/ads/library/?${params.toString()}`;
 }
 
