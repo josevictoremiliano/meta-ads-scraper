@@ -1,15 +1,23 @@
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());
 
 /**
- * Scraper v4 - Melhorias:
- * - CTA expandido (mais patterns)
- * - Data de inicio parseada corretamente (varios formatos PT-BR)
- * - video_url extraido do DOM
- * - landing_domain e image_url com matching por posicao melhorado
- * - Retry automatico em caso de timeout
- * - Scroll mais inteligente com deteccao de novos items
- * - Meta patterns mais completos para parser limpo
+ * Scraper v5 - Anti-deteccao:
+ * - playwright-extra + stealth plugin (spoofa fingerprint)
+ * - User-agent rotation realista
+ * - Delays aleatorios entre acoes
+ * - Deteccao rapida de bloqueio (retorna [] sem desperdicar tempo)
+ * - Viewport e locale realistas
  */
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+];
 
 const CTA_PATTERNS = [
   'Comprar agora', 'Saiba mais', 'Inscreva-se', 'Assinar', 'Cadastre-se',
@@ -23,272 +31,33 @@ const CTA_PATTERNS = [
 ];
 
 const META_PATTERNS = [
-  /Identificação da biblioteca/,
-  /Veiculação iniciada em/,
+  /Identificacao da biblioteca/,
+  /Veiculacao iniciada em/,
   /^Ativo$/i,
   /^Inativo$/i,
   /^Facebook$/i,
   /^Instagram$/i,
   /^Messenger$/i,
   /^Audience Network$/i,
-  /^Ver detalhes/i,
+  /^Ver detalhes$/i,
   /^Patrocinado$/i,
-  /^Saiba mais$/i,
   /^Comprar agora$/i,
   /^Comprar$/i,
-  /^Inscreva-se$/i,
-  /^Assinar$/i,
-  /^Cadastre-se$/i,
-  /^Plataformas$/i,
-  /^Abrir menu/i,
-  /versões/i,
-  /^Anunciar no Facebook/i,
-  /^Política de privacidade/i,
-  /^Termos e condições/i,
-  /^Sobre este anúncio/i,
-  /^Denunciar/i,
-  /^\d+ versão/i,
-  /^versão \d+/i,
-  /^Rótulo de isenção/i,
+  /^Saiba mais$/i,
+  /^\d+$/,
+  /^[A-Z0-9]{10,}$/,
+  /^Ver mais$/i,
+  /^Conteudo indisponivel/i,
+  /^Biblioteca de Anuncios/i,
+  /^Meta/i,
+  /^\s*$/,
 ];
 
-async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxResults = 30 }) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--window-size=1280,900',
-    ],
-  });
-
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'pt-BR',
-    viewport: { width: 1280, height: 900 },
-    extraHTTPHeaders: { 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' },
-  });
-
-  const page = await context.newPage();
-  // Bloquear apenas recursos pesados, mas manter imagens para capturar image_url
-  await page.route('**/*.{woff,woff2,ttf,mp4,webm}', r => r.abort());
-  await page.route('**/video/**', r => r.abort());
-
-  const url = buildUrl({ keyword, country, adCategory });
-  console.log(` Navegando: ${url}`);
-
-  // Retry: tenta navegar ate 2 vezes
-  let navOk = false;
-  for (let attempt = 1; attempt <= 2 && !navOk; attempt++) {
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      navOk = true;
-    } catch (e) {
-      console.warn(` Timeout no goto (tentativa ${attempt}), continuando...`);
-      if (attempt === 2) console.warn(' Prosseguindo com o que carregou.');
-    }
-  }
-
-  await page.waitForTimeout(4000);
-
-  // Scroll progressivo mais inteligente
-  const targetCount = Math.min(maxResults, 50);
-  let lastCount = 0;
-  let stableRounds = 0;
-  for (let i = 0; i < 12; i++) {
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    const adCount = (bodyText.match(/Identificação da biblioteca/g) || []).length;
-    console.log(` Scroll ${i + 1}: ${adCount} anúncios encontrados`);
-    if (adCount >= targetCount) break;
-    // Para se nao tiver mais novos items em 2 rounds
-    if (adCount === lastCount) {
-      stableRounds++;
-      if (stableRounds >= 2) break;
-    } else {
-      stableRounds = 0;
-    }
-    lastCount = adCount;
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
-    await page.waitForTimeout(2000);
-  }
-
-  const ads = await page.evaluate((params) => {
-    const { maxRes, ctaList, metaList } = params;
-    const results = [];
-    const bodyText = document.body.innerText;
-
-    // Reconstroi metaPatterns como RegExp
-    const metaPatterns = metaList.map(p => new RegExp(p.source || p, p.flags || 'i'));
-
-    const blocks = bodyText.split(/(?=Identificação da biblioteca\s*:\s*\d+)/);
-    for (const block of blocks.slice(0, maxRes + 1)) {
-      if (!block.includes('Identificação da biblioteca')) continue;
-      try {
-        // ID numerico
-        const idMatch = block.match(/Identificação da biblioteca\s*:\s*(\d+)/);
-        const adNumericId = idMatch ? idMatch[1] : null;
-        if (!adNumericId) continue;
-
-        const blockSemId = block.replace(/Identificação da biblioteca\s*:\s*\d+/g, '').trim();
-
-        // Status
-        const status = blockSemId.match(/\bAtivo\b/i) ? 'ACTIVE' : 'INACTIVE';
-
-        // Data de inicio - suporta multiplos formatos PT-BR
-        const dateMatch = blockSemId.match(
-          /Veiculação iniciada em\s+([^\n]+)/
-        );
-        let start_date = dateMatch ? dateMatch[1].trim() : null;
-        // Normaliza data: "1 de janeiro de 2025" ou "01/01/2025" ou "jan. de 2025"
-        if (start_date) {
-          start_date = start_date
-            .replace(/^(\d+)\s+de\s+(\w+)\s+de\s+(\d{4})$/, '$1/$2/$3')
-            .trim();
-        }
-
-        // Plataformas
-        const platforms = [];
-        const blockLower = blockSemId.toLowerCase();
-        if (blockLower.includes('facebook')) platforms.push('facebook');
-        if (blockLower.includes('instagram')) platforms.push('instagram');
-        if (blockLower.includes('audience network')) platforms.push('audience_network');
-        if (blockLower.includes('messenger')) platforms.push('messenger');
-        if (platforms.length === 0) platforms.push('facebook');
-
-        // Linhas limpas
-        const lines = blockSemId
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l.length > 0);
-
-        // Nome do anunciante: primeira linha nao-metadado, nao-numeros
-        let advertiser_name = null;
-        for (const line of lines) {
-          let isMeta = metaPatterns.some(p => p.test(line));
-          if (/^\d+$/.test(line)) isMeta = true;
-          // Ignora linhas muito curtas (1-2 chars)
-          if (!isMeta && line.length > 2) {
-            advertiser_name = line;
-            break;
-          }
-        }
-
-        // Texto do anuncio
-        const textLines = lines.filter(line => {
-          if (line === advertiser_name) return false;
-          if (metaPatterns.some(p => p.test(line))) return false;
-          if (/^\d+$/.test(line)) return false;
-          return line.length > 10;
-        });
-        const ad_text = textLines.slice(0, 5).join(' ') || null;
-
-        // CTA
-        let raw_offer_hint = null;
-        for (const cta of ctaList) {
-          if (blockSemId.toLowerCase().includes(cta.toLowerCase())) {
-            raw_offer_hint = cta;
-            break;
-          }
-        }
-
-        // Tipo de midia
-        const has_video = blockLower.includes('vídeo') || blockLower.includes('video');
-        const media_type = has_video ? 'video' : 'image';
-
-        // Snapshot URL
-        const ad_snapshot_url = `https://www.facebook.com/ads/library/?id=${adNumericId}`;
-
-        // creative_hash baseado em advertiser + texto + id
-        const hashStr = `${advertiser_name}|${ad_text}`;
-        let h = 0;
-        for (let i = 0; i < hashStr.length; i++) {
-          h = ((h << 5) - h) + hashStr.charCodeAt(i);
-          h |= 0;
-        }
-        const creative_hash = Math.abs(h).toString(16) + '_' + adNumericId;
-
-        if (advertiser_name && ad_text) {
-          results.push({
-            advertiser_name,
-            ad_text,
-            status,
-            start_date,
-            platforms,
-            media_type,
-            raw_offer_hint,
-            ad_snapshot_url,
-            advertiser_profile_url: null,
-            image_url: null,
-            video_url: null,
-            landing_domain: null,
-            creative_hash,
-            ad_numeric_id: adNumericId,
-          });
-        }
-      } catch (e) {
-        // ignora bloco com erro
-      }
-    }
-    return results;
-  }, {
-    maxRes: maxResults,
-    ctaList: CTA_PATTERNS,
-    metaList: META_PATTERNS.map(p => ({ source: p.source, flags: p.flags })),
-  });
-
-  // Enriquece com imagem, video e landing domain
-  const enriched = await page.evaluate((adsData) => {
-    // Extrai links externos (landing domains)
-    const allLinks = Array.from(document.querySelectorAll('a[href]'));
-    const externalDomains = allLinks
-      .filter(a => a.href &&
-        !a.href.includes('facebook.com') &&
-        !a.href.includes('instagram.com') &&
-        !a.href.includes('l.facebook.com') &&
-        a.href.startsWith('http'))
-      .map(a => {
-        try { return new URL(a.href).hostname.replace('www.', ''); }
-        catch { return null; }
-      })
-      .filter(Boolean);
-
-    // Extrai imagens de anuncios
-    const imgs = Array.from(document.querySelectorAll('img[src*="fbcdn"], img[src*="scontent"]'))
-      .filter(img => img.width > 50);
-
-    // Extrai videos
-    const vids = Array.from(document.querySelectorAll('video[src], source[src*="fbcdn"]'))
-      .map(v => v.src || v.getAttribute('src'))
-      .filter(Boolean);
-
-    return adsData.map((ad, i) => ({
-      ...ad,
-      landing_domain: externalDomains[i] || null,
-      image_url: imgs[i] ? imgs[i].src : null,
-      video_url: ad.media_type === 'video' && vids[i] ? vids[i] : null,
-    }));
-  }, ads);
-
-  await browser.close();
-
-  // Deduplica por creative_hash
-  const seen = new Set();
-  return enriched
-    .filter(ad => {
-      if (seen.has(ad.creative_hash)) return false;
-      seen.add(ad.creative_hash);
-      return true;
-    })
-    .map(ad => {
-      // Remove campo interno ad_numeric_id do output final
-      const { ad_numeric_id, ...rest } = ad;
-      return rest;
-    });
+function randomDelay(min = 800, max = 2500) {
+  return new Promise(r => setTimeout(r, Math.floor(Math.random() * (max - min)) + min));
 }
 
-function buildUrl({ keyword, country, adCategory }) {
+function buildUrl({ keyword, country = 'BR', adCategory = 'ALL' }) {
   const params = new URLSearchParams({
     active_status: 'active',
     ad_type: 'all',
@@ -298,6 +67,218 @@ function buildUrl({ keyword, country, adCategory }) {
     search_type: 'keyword_unordered',
   });
   return `https://www.facebook.com/ads/library/?${params.toString()}`;
+}
+
+async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxResults = 30 }) {
+  const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  });
+
+  const context = await browser.newContext({
+    userAgent,
+    locale: 'pt-BR',
+    timezoneId: 'America/Sao_Paulo',
+    viewport: { width: 1366 + Math.floor(Math.random()*200), height: 768 + Math.floor(Math.random()*100) },
+    extraHTTPHeaders: {
+      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    },
+  });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en'] });
+    window.chrome = { runtime: {} };
+  });
+
+  const page = await context.newPage();
+
+  await page.route('**/*', (route) => {
+    const url = route.request().url();
+    if (/\.(woff2?|ttf|otf|eot)/.test(url)) return route.abort();
+    return route.continue();
+  });
+
+  const url = buildUrl({ keyword, country, adCategory });
+  console.log(`[manual] Scraping keyword: "${keyword}" | country: ${country} | max: ${maxResults}`);
+  console.log(`Navegando: ${url}`);
+
+  let loaded = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await page.goto(url, { timeout: 60000, waitUntil: 'domcontentloaded' });
+      loaded = true;
+      break;
+    } catch (e) {
+      console.warn(`Tentativa ${attempt + 1} falhou: ${e.message}`);
+      if (attempt === 1) console.log('Prosseguindo com o que carregou.');
+    }
+  }
+
+  await randomDelay(2000, 4000);
+
+  // Detectar bloqueio rapido
+  const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+  const isBlocked = bodyText.length < 200 ||
+    bodyText.includes('Nao foi possivel carregar') ||
+    bodyText.includes('Something went wrong') ||
+    bodyText.includes('Access Denied') ||
+    bodyText.includes('Por favor, confirme que');
+
+  if (isBlocked) {
+    console.warn(`[blocked] Keyword "${keyword}" retornou pagina bloqueada/vazia. Pulando.`);
+    await browser.close();
+    return [];
+  }
+
+  // Scroll progressivo
+  let prevCount = 0;
+  let stableRounds = 0;
+  const MAX_SCROLLS = 15;
+
+  for (let i = 0; i < MAX_SCROLLS; i++) {
+    const adCount = await page.evaluate(() => {
+      return (document.body.innerText.match(/Identifica[cç][aã]o da biblioteca/g) || []).length;
+    }).catch(() => 0);
+
+    console.log(`Scroll ${i + 1}: ${adCount} anuncios encontrados`);
+
+    if (adCount >= maxResults) break;
+
+    if (adCount === prevCount) {
+      stableRounds++;
+      if (stableRounds >= 3) break;
+    } else {
+      stableRounds = 0;
+    }
+    prevCount = adCount;
+
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await randomDelay(1500, 3000);
+  }
+
+  // Extrair anuncios
+  const fullText = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+  const blocks = fullText.split(/(?=Identifica[cç][aã]o da biblioteca\s*:\s*\d)/);
+
+  const results = [];
+
+  for (const block of blocks) {
+    try {
+      const idMatch = block.match(/Identifica[cç][aã]o da biblioteca\s*:\s*(\d+)/);
+      if (!idMatch) continue;
+      const adNumericId = idMatch[1];
+
+      const statusMatch = block.match(/\b(Ativo|Inativo)\b/i);
+      const status = statusMatch ? statusMatch[1] : null;
+
+      const dateMatch = block.match(/(\d{1,2})\s+de\s+(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})/i) ||
+        block.match(/(\d{4})-(\d{2})-(\d{2})/) ||
+        block.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+
+      let start_date = null;
+      if (dateMatch) {
+        try { start_date = new Date(dateMatch[0]).toISOString().split('T')[0]; } catch {}
+      }
+
+      const platformMatches = block.match(/\b(Facebook|Instagram|Messenger|Audience Network)\b/gi) || [];
+      const platforms = [...new Set(platformMatches.map(p => p.trim()))];
+
+      const lines = block.split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0)
+        .filter(l => !META_PATTERNS.some(p => p.test(l)));
+
+      const advertiser_name = lines.find(l => l.length > 2 && l.length < 80) || '';
+
+      const ad_text = lines
+        .filter(l => l !== advertiser_name && l.length > 10)
+        .slice(0, 5)
+        .join(' ');
+
+      const cta_type = CTA_PATTERNS.find(c =>
+        block.toLowerCase().includes(c.toLowerCase())
+      ) || null;
+
+      const media_type = /v[ií]deo/i.test(block) ? 'video' : 'image';
+      const ad_snapshot_url = `https://www.facebook.com/ads/library/?id=${adNumericId}`;
+
+      // Hash criativo
+      const hashStr = `${advertiser_name}|${ad_text}`;
+      let h = 0;
+      for (let i = 0; i < hashStr.length; i++) {
+        h = ((h << 5) - h) + hashStr.charCodeAt(i);
+        h |= 0;
+      }
+      const creative_hash = Math.abs(h).toString(16) + '_' + adNumericId;
+
+      results.push({
+        keyword,
+        advertiser_name,
+        ad_text,
+        status,
+        start_date,
+        platforms,
+        cta_type,
+        media_type,
+        ad_snapshot_url,
+        creative_hash,
+        landing_domain: null,
+        image_url: null,
+        video_url: null,
+      });
+    } catch (e) {
+      // ignora bloco com erro
+    }
+  }
+
+  // Enriquecer com dados do DOM
+  try {
+    const domData = await page.evaluate(() => {
+      const externalDomains = Array.from(document.querySelectorAll('a[href]'))
+        .map(a => { try { return new URL(a.href).hostname; } catch { return null; } })
+        .filter(h => h && !h.includes('facebook') && !h.includes('fbcdn') && !h.includes('meta'));
+
+      const imgs = Array.from(document.querySelectorAll('img[src]'))
+        .map(img => img.src)
+        .filter(s => s.includes('fbcdn') || s.includes('scontent'));
+
+      const vids = Array.from(document.querySelectorAll('video source, video[src]'))
+        .map(v => v.src || v.getAttribute('src'))
+        .filter(Boolean);
+
+      return { externalDomains, imgs, vids };
+    });
+
+    results.forEach((ad, i) => {
+      if (domData.externalDomains[i]) ad.landing_domain = domData.externalDomains[i];
+      if (domData.imgs[i]) ad.image_url = domData.imgs[i];
+      if (domData.vids[i]) ad.video_url = domData.vids[i];
+    });
+  } catch (e) {
+    console.warn('Enriquecimento DOM falhou:', e.message);
+  }
+
+  await browser.close();
+
+  // Deduplicar por creative_hash
+  const seen = new Set();
+  const deduped = results.filter(ad => {
+    if (seen.has(ad.creative_hash)) return false;
+    seen.add(ad.creative_hash);
+    return true;
+  });
+
+  console.log(`[manual] Found ${deduped.length} ads for "${keyword}"`);
+  return deduped;
 }
 
 module.exports = { scrapeMetaAds };
