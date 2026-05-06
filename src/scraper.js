@@ -39,7 +39,7 @@ function randDelay(min = 1500, max = 3000) {
 
 function buildUrl(keyword, country = 'BR') {
   const p = new URLSearchParams({
-    active_status: 'active',
+    active_status: 'all',
     ad_type: 'all',
     country,
     is_targeted_country: 'false',
@@ -157,7 +157,7 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
         const advertiserName = lines[0] || 'Desconhecido';
 
         // Status
-        const status = /\bAtivo\b/i.test(text) ? 'Ativo' : (/\bInativo\b/i.test(text) ? 'Inativo' : 'Desconhecido');
+        const statusRaw = raw.html || ''; const status = (/inativo|inactive/i.test(statusRaw) || /inativo|inactive/i.test(text)) ? 'Inativo' : 'Ativo';
 
         // Data de inicio
         const dateMatch = text.match(/Iniciado em ([\d]+ de [\w]+ de \d{4}|[\d]{1,2}\/[\d]{1,2}\/\d{4})/);
