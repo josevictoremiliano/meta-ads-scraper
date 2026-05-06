@@ -1,14 +1,13 @@
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-chromium.use(StealthPlugin());
+const { chromium } = require('playwright');
 
 /**
- * Scraper v5 - Anti-deteccao:
- * - playwright-extra + stealth plugin (spoofa fingerprint)
- * - User-agent rotation realista
+ * Scraper v6 - Playwright nativo com stealth manual:
+ * - Sem playwright-extra (incompativel com imagem Docker Playwright)
+ * - addInitScript para spoofa webdriver, plugins, languages
+ * - User-agent rotation via context.newContext()
  * - Delays aleatorios entre acoes
- * - Deteccao rapida de bloqueio (retorna [] sem desperdicar tempo)
- * - Viewport e locale realistas
+ * - Deteccao de bloqueio rapida
+ * - URL com active_status=active para resultados atuais
  */
 
 const USER_AGENTS = [
@@ -31,8 +30,8 @@ const CTA_PATTERNS = [
 ];
 
 const META_PATTERNS = [
-  /Identificacao da biblioteca/,
-  /Veiculacao iniciada em/,
+  /Identifica[cç][aã]o da biblioteca/,
+  /Veicul[aã]o iniciada em/,
   /^Ativo$/i,
   /^Inativo$/i,
   /^Facebook$/i,
@@ -47,17 +46,17 @@ const META_PATTERNS = [
   /^\d+$/,
   /^[A-Z0-9]{10,}$/,
   /^Ver mais$/i,
-  /^Conteudo indisponivel/i,
-  /^Biblioteca de Anuncios/i,
+  /^Conte[uú]do indispon[ií]vel/i,
+  /^Biblioteca de An[uú]ncios/i,
   /^Meta/i,
   /^\s*$/,
 ];
 
-function randomDelay(min = 800, max = 2500) {
+function randomDelay(min = 1000, max = 3000) {
   return new Promise(r => setTimeout(r, Math.floor(Math.random() * (max - min)) + min));
 }
 
-function buildUrl({ keyword, country = 'BR', adCategory = 'ALL' }) {
+function buildUrl(keyword, country = 'BR') {
   const params = new URLSearchParams({
     active_status: 'active',
     ad_type: 'all',
@@ -71,6 +70,7 @@ function buildUrl({ keyword, country = 'BR', adCategory = 'ALL' }) {
 
 async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxResults = 30 }) {
   const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -78,7 +78,8 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-infobars',
+      '--window-size=1366,768',
     ],
   });
 
@@ -86,55 +87,77 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
     userAgent,
     locale: 'pt-BR',
     timezoneId: 'America/Sao_Paulo',
-    viewport: { width: 1366 + Math.floor(Math.random()*200), height: 768 + Math.floor(Math.random()*100) },
+    viewport: { width: 1366, height: 768 },
     extraHTTPHeaders: {
       'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     },
   });
 
+  // Stealth manual via addInitScript
   await context.addInitScript(() => {
+    // Remove webdriver flag
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en'] });
-    window.chrome = { runtime: {} };
+    // Fake plugins
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => {
+        const arr = [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }];
+        arr.__proto__ = PluginArray.prototype;
+        return arr;
+      },
+    });
+    // Fake languages
+    Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
+    // Fake chrome runtime
+    if (!window.chrome) window.chrome = {};
+    if (!window.chrome.runtime) window.chrome.runtime = {};
+    // Fake permissions
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
+    }
   });
 
   const page = await context.newPage();
 
+  // Bloquear recursos pesados
   await page.route('**/*', (route) => {
     const url = route.request().url();
-    if (/\.(woff2?|ttf|otf|eot)/.test(url)) return route.abort();
+    const type = route.request().resourceType();
+    if (type === 'font' || type === 'media') return route.abort();
     return route.continue();
   });
 
-  const url = buildUrl({ keyword, country, adCategory });
+  const url = buildUrl(keyword, country);
   console.log(`[manual] Scraping keyword: "${keyword}" | country: ${country} | max: ${maxResults}`);
   console.log(`Navegando: ${url}`);
 
-  let loaded = false;
+  // Navegacao com retry
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await page.goto(url, { timeout: 60000, waitUntil: 'domcontentloaded' });
-      loaded = true;
       break;
     } catch (e) {
-      console.warn(`Tentativa ${attempt + 1} falhou: ${e.message}`);
+      console.warn(`Tentativa ${attempt + 1} falhou: ${e.message.substring(0, 80)}`);
       if (attempt === 1) console.log('Prosseguindo com o que carregou.');
     }
   }
 
-  await randomDelay(2000, 4000);
+  await randomDelay(2500, 5000);
 
-  // Detectar bloqueio rapido
+  // Detectar bloqueio
   const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
-  const isBlocked = bodyText.length < 200 ||
-    bodyText.includes('Nao foi possivel carregar') ||
+  const isBlocked = bodyText.length < 300 ||
+    bodyText.includes('Nao foi possivel') ||
     bodyText.includes('Something went wrong') ||
     bodyText.includes('Access Denied') ||
-    bodyText.includes('Por favor, confirme que');
+    bodyText.includes('confirme que');
 
   if (isBlocked) {
-    console.warn(`[blocked] Keyword "${keyword}" retornou pagina bloqueada/vazia. Pulando.`);
+    console.warn(`[blocked] "${keyword}" - pagina bloqueada/vazia (${bodyText.length} chars). Pulando.`);
     await browser.close();
     return [];
   }
@@ -142,11 +165,12 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
   // Scroll progressivo
   let prevCount = 0;
   let stableRounds = 0;
-  const MAX_SCROLLS = 15;
+  const MAX_SCROLLS = 12;
 
   for (let i = 0; i < MAX_SCROLLS; i++) {
     const adCount = await page.evaluate(() => {
-      return (document.body.innerText.match(/Identifica[cç][aã]o da biblioteca/g) || []).length;
+      const text = document.body.innerText || '';
+      return (text.match(/Identifica[cç][aã]o da biblioteca/g) || []).length;
     }).catch(() => 0);
 
     console.log(`Scroll ${i + 1}: ${adCount} anuncios encontrados`);
@@ -162,7 +186,7 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
     prevCount = adCount;
 
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await randomDelay(1500, 3000);
+    await randomDelay(2000, 4000);
   }
 
   // Extrair anuncios
@@ -180,7 +204,8 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
       const statusMatch = block.match(/\b(Ativo|Inativo)\b/i);
       const status = statusMatch ? statusMatch[1] : null;
 
-      const dateMatch = block.match(/(\d{1,2})\s+de\s+(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})/i) ||
+      const dateMatch =
+        block.match(/(\d{1,2})\s+de\s+(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})/i) ||
         block.match(/(\d{4})-(\d{2})-(\d{2})/) ||
         block.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
 
@@ -205,13 +230,12 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
         .join(' ');
 
       const cta_type = CTA_PATTERNS.find(c =>
-        block.toLowerCase().includes(c.toLowerCase())
-      ) || null;
+        block.toLowerCase().includes(c.toLowerCase()
+        )) || null;
 
       const media_type = /v[ií]deo/i.test(block) ? 'video' : 'image';
       const ad_snapshot_url = `https://www.facebook.com/ads/library/?id=${adNumericId}`;
 
-      // Hash criativo
       const hashStr = `${advertiser_name}|${ad_text}`;
       let h = 0;
       for (let i = 0; i < hashStr.length; i++) {
@@ -240,7 +264,7 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
     }
   }
 
-  // Enriquecer com dados do DOM
+  // Enriquecer com dados DOM
   try {
     const domData = await page.evaluate(() => {
       const externalDomains = Array.from(document.querySelectorAll('a[href]'))
@@ -269,7 +293,6 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
 
   await browser.close();
 
-  // Deduplicar por creative_hash
   const seen = new Set();
   const deduped = results.filter(ad => {
     if (seen.has(ad.creative_hash)) return false;
