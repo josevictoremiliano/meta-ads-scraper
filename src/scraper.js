@@ -1,12 +1,11 @@
 const { chromium } = require('playwright');
+const crypto = require('crypto');
 
 /**
- * Scraper v7 - Otimizado para velocidade e cobertura maxima de keywords:
- * - Timeout reduzido para deteccao rapida de keywords sem resultados
- * - Scroll mais agressivo para carregar mais anuncios
- * - Deteccao rapida de bloqueio/sem resultados
- * - addInitScript para stealth manual
- * - User-agent rotation via context.newContext()
+ * Scraper v8 - Fixed block detection, better ad extraction
+ * - Removed overly aggressive block detection (false positives)
+ * - Uses URL-based block detection instead of content-based
+ * - Improved CSS selectors for ad cards
  */
 
 const USER_AGENTS = [
@@ -14,7 +13,6 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 ];
 
 const CTA_PATTERNS = [
@@ -28,19 +26,11 @@ const CTA_PATTERNS = [
   'Baixar gratis', 'Download gratis', 'Instalar', 'Jogar agora',
 ];
 
-const META_PATTERNS = [
-  /Identifica[cc][ao]o da biblioteca/,
-  /Ativo/i,
-  /^Inativo$/i,
-  /Iniciado em/i,
-  /Anunciante/i,
-];
-
 function randomDelay(min = 500, max = 1500) {
   return new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min) + min)));
 }
 
-function buildUrl(keyword, country = 'BR', adCategory = 'ALL') {
+function buildUrl(keyword, country = 'BR') {
   const params = new URLSearchParams({
     active_status: 'active',
     ad_type: 'all',
@@ -67,7 +57,6 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
       '--disable-gpu',
       '--window-size=1280,800',
       '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
     ],
   });
 
@@ -78,29 +67,20 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
     timezoneId: 'America/Sao_Paulo',
     extraHTTPHeaders: {
       'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     },
   });
 
-  // Stealth: remove webdriver traces
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
     Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
     window.chrome = { runtime: {} };
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) =>
-      parameters.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : originalQuery(parameters);
   });
 
   const page = await context.newPage();
 
-  // Block unnecessary resources for speed
-  await page.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}', route => route.abort());
-  await page.route('**/video/**', route => route.abort());
-  await page.route('**/{analytics,tracking,beacon}**', route => route.abort());
+  // Only block heavy media to speed up loading
+  await page.route('**/*.{woff,woff2,ttf,eot}', route => route.abort());
 
   const ads = [];
   const seenHashes = new Set();
@@ -109,113 +89,107 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
     const url = buildUrl(keyword, country);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // Quick check for block or no results
-    await randomDelay(2000, 3500);
+    await randomDelay(3000, 5000);
 
-    // Check if blocked
-    const pageContent = await page.content();
-    if (
-      pageContent.includes('checkpoint') ||
-      pageContent.includes('login_form') ||
-      pageContent.includes('Please log in')
-    ) {
-      console.log(`Blocked for keyword: "${keyword}"`);
+    // Check if redirected to login/blocked page (URL-based detection only)
+    const currentUrl = page.url();
+    if (currentUrl.includes('/login') || currentUrl.includes('checkpoint') || currentUrl.includes('recover')) {
+      console.log(`Blocked/redirected for keyword: "${keyword}" -> ${currentUrl}`);
       await browser.close();
       return [];
     }
 
-    // Check for no results quickly
-    const noResults = await page.$('[data-testid="no_results"]') ||
-      await page.$('div[role="main"] :text("Nenhum resultado encontrado")').catch(() => null);
-    if (noResults) {
-      console.log(`No results for keyword: "${keyword}"`);
-      await browser.close();
-      return [];
-    }
-
-    // Scroll to load more ads
+    // Scroll and extract ads
     let prevAdCount = 0;
     let noChangeCount = 0;
-    const maxNoChange = 3;
+    const maxNoChange = 4;
 
-    while (ads.length < maxResults) {
-      // Extract currently visible ads
+    for (let scrollAttempt = 0; scrollAttempt < 15 && ads.length < maxResults; scrollAttempt++) {
+      // Try multiple selectors to find ad cards
       const rawAds = await page.evaluate(() => {
-        const cards = document.querySelectorAll('div[class*="x8t9es0"]');
         const results = [];
+        const seen = new Set();
+
+        // Try various selectors that Facebook uses for ad cards
+        const selectors = [
+          '[data-testid="ad-library-ad-card"]',
+          'div._7jyr',
+          'div[class*="_7jyr"]',
+          'div[class*="x8t9es0"][class*="x1fvot60"]',
+        ];
+
+        let cards = [];
+        for (const sel of selectors) {
+          const found = document.querySelectorAll(sel);
+          if (found.length > 0) {
+            cards = Array.from(found);
+            break;
+          }
+        }
+
+        // Fallback: find divs with substantial text that look like ads
+        if (cards.length === 0) {
+          const allDivs = document.querySelectorAll('div[role="article"]');
+          cards = Array.from(allDivs);
+        }
+
         cards.forEach(card => {
-          const text = card.innerText || '';
-          if (text.length > 50) {
-            results.push({
-              html: card.innerHTML.substring(0, 5000),
-              text: text.substring(0, 2000),
-            });
+          const text = (card.innerText || '').trim();
+          if (text.length > 100) {
+            const key = text.substring(0, 100);
+            if (!seen.has(key)) {
+              seen.add(key);
+              results.push({
+                html: card.innerHTML.substring(0, 5000),
+                text: text.substring(0, 2000),
+              });
+            }
           }
         });
+
         return results;
       });
 
-      // Parse ad data
+      // Parse each raw ad
       for (const raw of rawAds) {
         const adText = raw.text;
+        const creative_hash = crypto.createHash('md5').update(adText.substring(0, 500)).digest('hex');
 
-        // Try to extract advertiser name
-        const advertiserMatch = adText.match(/([A-Z][^\n]{2,50})(?=\nAnunciante|\nPatrocinado|\nSeguir)/);
+        if (seenHashes.has(creative_hash)) continue;
+        seenHashes.add(creative_hash);
+
+        const advertiserMatch = adText.match(/([A-Z][^\n]{2,50})\n/);
         const advertiserName = advertiserMatch ? advertiserMatch[1].trim() : 'Desconhecido';
-
-        // Status detection
         const status = /Ativo/i.test(adText) ? 'Ativo' : (/Inativo/i.test(adText) ? 'Inativo' : 'Desconhecido');
-
-        // Start date
-        const dateMatch = adText.match(/Iniciado em (\d{1,2} de \w+ de \d{4}|\d{1,2}\/\d{1,2}\/\d{4})/);
-        const startDate = dateMatch ? dateMatch[1] : null;
-
-        // CTA detection
+        const dateMatch = adText.match(/Iniciado em ([\d]+ de \w+ de \d{4})/);
         const ctaType = CTA_PATTERNS.find(cta => adText.toLowerCase().includes(cta.toLowerCase())) || null;
-
-        // Media type
         const mediaType = raw.html.includes('<video') ? 'video' : (raw.html.includes('<img') ? 'image' : 'text');
-
-        // Extract URLs from html
         const snapshotMatch = raw.html.match(/href="(https:\/\/www\.facebook\.com\/ads\/library\/\?id=[^"]+)"/);
-        const adSnapshotUrl = snapshotMatch ? snapshotMatch[1].replace(/&amp;/g, '&') : null;
-
-        const imageMatch = raw.html.match(/src="(https:\/\/[^"]*scontent[^"]*)"/); 
-        const imageUrl = imageMatch ? imageMatch[1].replace(/&amp;/g, '&') : null;
-
-        // Landing domain
+        const imageMatch = raw.html.match(/src="(https:\/\/[^"]*scontent[^"]*)"/i);
         const landingMatch = raw.html.match(/href="(https?:\/\/(?!www\.facebook\.com)[^"]+)"/);
         const landingDomain = landingMatch ? (() => { try { return new URL(landingMatch[1].replace(/&amp;/g, '&')).hostname; } catch(e) { return null; } })() : null;
 
-        // Creative hash
-        const crypto = require('crypto');
-        const creative_hash = crypto.createHash('md5').update(adText.substring(0, 500)).digest('hex');
-
-        if (!seenHashes.has(creative_hash) && adText.length > 100) {
-          seenHashes.add(creative_hash);
-          ads.push({
-            keyword,
-            advertiser_name: advertiserName,
-            ad_text: adText.substring(0, 1000),
-            status,
-            start_date: startDate,
-            platforms: [],
-            cta_type: ctaType,
-            media_type: mediaType,
-            ad_snapshot_url: adSnapshotUrl,
-            creative_hash,
-            landing_domain: landingDomain,
-            image_url: imageUrl,
-            video_url: null,
-          });
-        }
+        ads.push({
+          keyword,
+          advertiser_name: advertiserName,
+          ad_text: adText.substring(0, 1000),
+          status,
+          start_date: dateMatch ? dateMatch[1] : null,
+          platforms: [],
+          cta_type: ctaType,
+          media_type: mediaType,
+          ad_snapshot_url: snapshotMatch ? snapshotMatch[1].replace(/&amp;/g, '&') : null,
+          creative_hash,
+          landing_domain: landingDomain,
+          image_url: imageMatch ? imageMatch[1].replace(/&amp;/g, '&') : null,
+          video_url: null,
+        });
       }
 
-      console.log(`Found ${ads.length} ads so far for "${keyword}"`);
+      console.log(`[${scrollAttempt+1}] Found ${ads.length} ads for "${keyword}"`);
 
       if (ads.length >= maxResults) break;
 
-      // Check if we're making progress
       if (ads.length === prevAdCount) {
         noChangeCount++;
         if (noChangeCount >= maxNoChange) {
@@ -227,9 +201,8 @@ async function scrapeMetaAds({ keyword, country = 'BR', adCategory = 'ALL', maxR
       }
       prevAdCount = ads.length;
 
-      // Scroll down
-      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
-      await randomDelay(1500, 2500);
+      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
+      await randomDelay(2000, 3500);
     }
 
   } catch (err) {
